@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	kbatch "k8s.io/api/batch/v1"
@@ -141,6 +142,19 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// cleanup old jobs
+	if instance.Spec.FailedJobsHistoryLimit != nil {
+		if err := r.deleteOldJobs(ctx, failedJobs, *instance.Spec.FailedJobsHistoryLimit); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	if instance.Spec.SuccessfulJobsHistoryLimit != nil {
+		if err := r.deleteOldJobs(ctx, successfulJobs, *instance.Spec.SuccessfulJobsHistoryLimit); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -151,6 +165,28 @@ func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+func (r *CronJobReconciler) deleteOldJobs(ctx context.Context, jobs []*kbatch.Job, historyLimit int32) error {
+	log := log.FromContext(ctx)
+
+	// sort in ascending order of start time
+	sortJobsOnStartTime(jobs)
+
+	for i, job := range jobs {
+		if int32(i) >= int32(len(jobs))-historyLimit {
+			break
+		}
+
+		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			log.Error(err, "unable to delete old job", "job", job)
+			return err
+		} else {
+			log.V(0).Info("deleted old job", "job", job)
+		}
+	}
+
+	return nil
+}
+
 func isJobFinished(job *kbatch.Job) (bool, kbatch.JobConditionType) {
 	for _, c := range job.Status.Conditions {
 		if (c.Type == kbatch.JobComplete || c.Type == kbatch.JobFailed) && c.Status == corev1.ConditionTrue {
@@ -158,6 +194,7 @@ func isJobFinished(job *kbatch.Job) (bool, kbatch.JobConditionType) {
 			return true, c.Type
 		}
 	}
+
 	return false, ""
 }
 
@@ -173,4 +210,15 @@ func getScheduledTimeForJob(job *kbatch.Job) (*time.Time, error) {
 	}
 
 	return &timeParsed, nil
+}
+
+func sortJobsOnStartTime(jobs []*kbatch.Job) {
+	sort.Slice(jobs, func(i, j int) bool {
+		firstJob, secondJob := jobs[i], jobs[j]
+
+		if firstJob.Status.StartTime == nil {
+			return secondJob.Status.StartTime != nil
+		}
+		return firstJob.Status.StartTime.Before(secondJob.Status.StartTime)
+	})
 }
