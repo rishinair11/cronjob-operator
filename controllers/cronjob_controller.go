@@ -22,7 +22,9 @@ import (
 
 	kbatch "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	ref "k8s.io/client-go/tools/reference"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -59,8 +61,8 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	log := log.FromContext(ctx)
 
 	// Fetch the current CronJob instance
-	var cronJob batchv1.CronJob
-	if err := r.Get(ctx, req.NamespacedName, &cronJob); err != nil {
+	var instance batchv1.CronJob
+	if err := r.Get(ctx, req.NamespacedName, &instance); err != nil {
 		log.Error(err, "unable to fetch CronJob")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -75,6 +77,67 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	if err := r.List(ctx, &childJobs, listOpts...); err != nil {
 		log.Error(err, "unable to list child jobs")
+		return ctrl.Result{}, err
+	}
+
+	var activeJobs, successfulJobs, failedJobs []*kbatch.Job
+	var mostRecentTime *time.Time
+
+	for _, job := range childJobs.Items {
+		// segregate jobs based on type
+		_, finishedType := isJobFinished(&job)
+		switch finishedType {
+		case "": // ongoing
+			activeJobs = append(activeJobs, &job)
+		case kbatch.JobComplete:
+			successfulJobs = append(successfulJobs, &job)
+		case kbatch.JobFailed:
+			successfulJobs = append(failedJobs, &job)
+		}
+		// compute mostRecentTime from scheduledTime annotation value
+		scheduledTimeForJob, err := getScheduledTimeForJob(&job)
+		if err != nil {
+			log.Error(err, "unable to parse scheduled time for job", "job", &job)
+			continue
+		}
+
+		if scheduledTimeForJob == nil {
+			continue
+		}
+
+		// if current childjob is to start later than mostRecentTime then update mostRecentTime
+		if mostRecentTime == nil || mostRecentTime.Before(*scheduledTimeForJob) {
+			mostRecentTime = scheduledTimeForJob
+		}
+	}
+
+	if mostRecentTime != nil {
+		instance.Status.LastScheduleTime = &metav1.Time{Time: *mostRecentTime}
+	} else {
+		instance.Status.LastScheduleTime = nil
+	}
+
+	instance.Status.Active = nil
+	for _, job := range activeJobs {
+		jobRef, err := ref.GetReference(r.Scheme, job)
+		if err != nil {
+			log.Error(err, "unable to make reference to active job", "job", job)
+			continue
+		}
+
+		instance.Status.Active = append(instance.Status.Active, *jobRef)
+	}
+
+	// log child job counts at verbosity 1
+	log.V(1).Info("job count",
+		"active jobs", len(activeJobs),
+		"successful jobs", len(successfulJobs),
+		"failed jobs", len(failedJobs),
+	)
+
+	// update the status subresource of the CR
+	if err := r.Status().Update(ctx, &instance); err != nil {
+		log.Error(err, "unable to update CronJob status")
 		return ctrl.Result{}, err
 	}
 
@@ -96,4 +159,18 @@ func isJobFinished(job *kbatch.Job) (bool, kbatch.JobConditionType) {
 		}
 	}
 	return false, ""
+}
+
+func getScheduledTimeForJob(job *kbatch.Job) (*time.Time, error) {
+	timeRaw := job.GetAnnotations()[scheduledTimeAnnotation]
+	if len(timeRaw) == 0 {
+		return nil, nil
+	}
+
+	timeParsed, err := time.Parse(time.RFC3339, timeRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	return &timeParsed, nil
 }
