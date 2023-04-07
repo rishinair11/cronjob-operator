@@ -18,7 +18,10 @@ package controllers
 
 import (
 	"context"
+	"time"
 
+	kbatch "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,29 +30,53 @@ import (
 	batchv1 "tutorial.kubebuilder.io/project/api/v1"
 )
 
+var (
+	scheduledTimeAnnotation = "batch.tutorial.kubebuilder.io/scheduled-at"
+)
+
 // CronJobReconciler reconciles a CronJob object
 type CronJobReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	Clock
 }
 
-//+kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs/finalizers,verbs=update
+type realClock struct{}
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the CronJob object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
+func (_ realClock) Now() time.Time { return time.Now() }
+
+type Clock interface {
+	Now() time.Time
+}
+
+// +kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs/finalizers,verbs=update
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
+
 func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
+	log := log.FromContext(ctx)
 
-	// TODO(user): your logic here
+	// Fetch the current CronJob instance
+	var cronJob batchv1.CronJob
+	if err := r.Get(ctx, req.NamespacedName, &cronJob); err != nil {
+		log.Error(err, "unable to fetch CronJob")
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// List active child jobs of the current CronJob instance
+	var childJobs kbatch.JobList
+	listOpts := []client.ListOption{
+		client.InNamespace(req.Namespace),
+		client.MatchingFields{
+			"jobOwnerKey": req.Name,
+		},
+	}
+	if err := r.List(ctx, &childJobs, listOpts...); err != nil {
+		log.Error(err, "unable to list child jobs")
+		return ctrl.Result{}, err
+	}
 
 	return ctrl.Result{}, nil
 }
@@ -59,4 +86,14 @@ func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&batchv1.CronJob{}).
 		Complete(r)
+}
+
+func isJobFinished(job *kbatch.Job) (bool, kbatch.JobConditionType) {
+	for _, c := range job.Status.Conditions {
+		if (c.Type == kbatch.JobComplete || c.Type == kbatch.JobFailed) && c.Status == corev1.ConditionTrue {
+			// job is either completed or failed, and the status is true (finished)
+			return true, c.Type
+		}
+	}
+	return false, ""
 }
