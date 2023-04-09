@@ -176,7 +176,59 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	log = log.WithValues("now", r.Now(), "next run", nextRun)
 
-	return ctrl.Result{}, nil
+	// run job if:
+	// - if it's on schedule
+	// - not past deadline
+	// - not blocked by the concurrency policy
+	if missedRun.IsZero() {
+		log.V(1).Info("no upcoming scheduled times, sleeping until next")
+		return scheduledResult, nil
+	}
+
+	// make sure it's not too late to start run
+	log = log.WithValues("current run", missedRun)
+	var tooLate bool
+	if instance.Spec.StartingDeadlineSeconds != nil {
+		missedDuration := missedRun.Add(time.Duration(*instance.Spec.StartingDeadlineSeconds) * time.Second)
+		tooLate = missedDuration.Before(r.Now())
+	}
+
+	if tooLate {
+		log.V(1).Info("missed starting deadline for last run, sleeping until next")
+		return scheduledResult, nil
+	}
+
+	// manage active jobs based on concurrency policy
+	switch instance.Spec.ConcurrencyPolicy {
+	case batchv1.ForbidConcurrent:
+		if len(activeJobs) > 0 {
+			log.V(1).Info("concurrency policy blocks concurrent runs, skipping", "num active", len(activeJobs))
+			return scheduledResult, nil
+		}
+	case batchv1.ReplaceConcurrent:
+		for _, activeJob := range activeJobs {
+			if err := r.Delete(ctx, activeJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, nil
+			}
+		}
+	}
+
+	// create the desired job
+	job, err := r.constructJob(&instance, missedRun)
+	if err != nil {
+		log.Error(err, "unable to construct job from template")
+		// dont bother requeueing until spec is changed
+		return scheduledResult, nil
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		log.Error(err, "unable to create Job for CronJob", "job", job)
+		return ctrl.Result{}, nil
+	}
+
+	log.V(1).Info("created Job for CronJob run", "job", job)
+
+	return scheduledResult, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -206,6 +258,38 @@ func (r *CronJobReconciler) deleteOldJobs(ctx context.Context, jobs []*kbatch.Jo
 	}
 
 	return nil
+}
+
+func (r *CronJobReconciler) constructJob(cronJob *batchv1.CronJob, scheduledTime time.Time) (*kbatch.Job, error) {
+	// generate deterministic job name
+	name := fmt.Sprintf("%s-%d", cronJob.Name, scheduledTime.Unix())
+
+	job := &kbatch.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      make(map[string]string),
+			Annotations: make(map[string]string),
+			Name:        name,
+			Namespace:   cronJob.GetNamespace(),
+		},
+		Spec: *cronJob.Spec.JobTemplate.Spec.DeepCopy(),
+	}
+
+	// fill the annotations
+	for k, v := range cronJob.Spec.JobTemplate.Annotations {
+		job.Annotations[k] = v
+	}
+	job.Annotations[scheduledTimeAnnotation] = scheduledTime.Format(time.RFC3339)
+
+	// fill the labels
+	for k, v := range cronJob.Spec.JobTemplate.Labels {
+		job.Labels[k] = v
+	}
+
+	if err := ctrl.SetControllerReference(cronJob, job, r.Scheme); err != nil {
+		return nil, err
+	}
+
+	return job, nil
 }
 
 func isJobFinished(job *kbatch.Job) (bool, kbatch.JobConditionType) {
