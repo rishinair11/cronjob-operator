@@ -155,6 +155,12 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	// skip creation of new jobs if CR has suspend: true
+	if instance.Spec.Suspend != nil && *instance.Spec.Suspend {
+		log.V(1).Info("cronjob suspended, skipping")
+		return ctrl.Result{}, nil
+	}
+
 	return ctrl.Result{}, nil
 }
 
