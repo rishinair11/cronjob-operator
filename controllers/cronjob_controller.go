@@ -18,9 +18,11 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
+	"github.com/robfig/cron"
 	kbatch "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -161,6 +163,19 @@ func (r *CronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	// calculate the next time the job has to be created
+	missedRun, nextRun, err := getNextSchedule(&instance, r.Now())
+	if err != nil {
+		log.Error(err, "unable to figure out CronJob schedule")
+		return ctrl.Result{}, err
+	}
+
+	// prep requeue request until next job
+	scheduledResult := ctrl.Result{
+		RequeueAfter: nextRun.Sub(r.Now()),
+	}
+	log = log.WithValues("now", r.Now(), "next run", nextRun)
+
 	return ctrl.Result{}, nil
 }
 
@@ -227,4 +242,42 @@ func sortJobsOnStartTime(jobs []*kbatch.Job) {
 		}
 		return firstJob.Status.StartTime.Before(secondJob.Status.StartTime)
 	})
+}
+
+func getNextSchedule(cronJob *batchv1.CronJob, now time.Time) (lastMissed, next time.Time, err error) {
+	sched, err := cron.ParseStandard(cronJob.Spec.Schedule)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("unparseable schedule %q: %v", cronJob.Spec.Schedule, err)
+	}
+
+	// start from last observed run time
+	var earliestTime time.Time
+	if cronJob.Status.LastScheduleTime != nil {
+		earliestTime = cronJob.Status.LastScheduleTime.Time
+	} else {
+		earliestTime = cronJob.GetObjectMeta().GetCreationTimestamp().Time
+	}
+
+	if cronJob.Spec.StartingDeadlineSeconds != nil {
+		// controller won't schedule anything below this point
+		schedulingDeadline := now.Add(-time.Second * time.Duration(*cronJob.Spec.StartingDeadlineSeconds))
+
+		if schedulingDeadline.After(earliestTime) {
+			earliestTime = schedulingDeadline
+		}
+	}
+	if earliestTime.After(now) {
+		return time.Time{}, sched.Next(now), nil
+	}
+
+	starts := 0
+	for t := sched.Next(earliestTime); !t.After(now); t = sched.Next(t) {
+		lastMissed = t
+		starts++
+		if starts > 100 {
+			// we can't get the most recent times so just return an empty slice
+			return time.Time{}, time.Time{}, fmt.Errorf("too many missed start times (> 100). Set or decrease .spec.startingDeadlineSeconds or check clock skew")
+		}
+	}
+	return lastMissed, sched.Next(now), nil
 }
